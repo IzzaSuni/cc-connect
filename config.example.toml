@@ -2052,6 +2052,20 @@ app_secret = "your-feishu-app-secret"
 # args = ["acp", "serve"]
 # display_name = "COCO ACP"
 
+# --- Optional: cap concurrent session/prompt calls to the ACP backend ---
+# Some ACP backends (e.g. Kiro's bridge) rate-limit per account rather than
+# per session. If several IM channels route to the same ACP project, they
+# can hammer the backend in parallel and trigger errors the backend reports
+# as a generic internal error. Set max_concurrent_prompts to serialize (or
+# cap) in-flight session/prompt calls across every session this Agent
+# starts. Omit or set to 0 for unlimited (default, pre-existing behaviour).
+# 某些 ACP 后端（如 Kiro 的桥接服务）按账号而非会话限流。若多个 IM 频道
+# 共用同一个 ACP 项目，并发请求可能触发限流导致的内部错误。设置
+# max_concurrent_prompts 以限制该 Agent 下所有会话同时在途的 session/prompt
+# 调用数；省略或设为 0 表示不限制（默认，原有行为不变）。
+# [projects.agent.options]
+# max_concurrent_prompts = 1
+
 # --- Example: GitHub Copilot CLI (public preview) ---
 # Docs: https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server
 # Requires Copilot CLI installed and authenticated; no auth_method for ACP subprocess.

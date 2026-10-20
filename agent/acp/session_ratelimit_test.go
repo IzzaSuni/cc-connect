@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -145,6 +146,100 @@ func TestSend_internalErrorWithoutRateLimitNotRetried(t *testing.T) {
 	}
 	if len(*prompts) != 1 {
 		t.Fatalf("prompt calls = %d, want 1 (no rate_limit signal, no retry)", len(*prompts))
+	}
+}
+
+// serveTrackingConcurrency answers every session/prompt after `hold`, while
+// recording the highest number of requests it was handling simultaneously.
+func serveTrackingConcurrency(rReq io.Reader, wResp io.Writer, hold time.Duration, inFlight, maxSeen *atomic.Int64) *sync.WaitGroup {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sc := bufio.NewScanner(rReq)
+		for sc.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+			}
+			if json.Unmarshal(sc.Bytes(), &req) != nil || req.Method != "session/prompt" {
+				continue
+			}
+			go func(id json.RawMessage) {
+				n := inFlight.Add(1)
+				mu.Lock()
+				if n > maxSeen.Load() {
+					maxSeen.Store(n)
+				}
+				mu.Unlock()
+				time.Sleep(hold)
+				inFlight.Add(-1)
+				_, _ = fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", id)
+			}(req.ID)
+		}
+	}()
+	return &wg
+}
+
+func TestSend_maxConcurrentPromptsSerializesAcrossSessions(t *testing.T) {
+	sem := make(chan struct{}, 1)
+	var inFlight, maxSeen atomic.Int64
+
+	s1, wResp1, rReq1 := newTestSession(t, &fakeCallbacks{})
+	s1.promptSem = sem
+	s2, wResp2, rReq2 := newTestSession(t, &fakeCallbacks{})
+	s2.promptSem = sem
+	s2.acpSessID = "test-session-id-2"
+
+	serveTrackingConcurrency(rReq1, wResp1, 80*time.Millisecond, &inFlight, &maxSeen)
+	serveTrackingConcurrency(rReq2, wResp2, 80*time.Millisecond, &inFlight, &maxSeen)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var err1, err2 error
+	go func() { defer wg.Done(); err1 = s1.Send("first", "m1", nil, nil) }()
+	go func() { defer wg.Done(); err2 = s2.Send("second", "m2", nil, nil) }()
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("Send 1: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("Send 2: %v", err2)
+	}
+	if got := maxSeen.Load(); got != 1 {
+		t.Fatalf("max concurrent server-side prompts = %d, want 1 (promptSem of size 1 should serialize)", got)
+	}
+}
+
+func TestSend_nilPromptSemAllowsConcurrentSends(t *testing.T) {
+	var inFlight, maxSeen atomic.Int64
+
+	s1, wResp1, rReq1 := newTestSession(t, &fakeCallbacks{})
+	s2, wResp2, rReq2 := newTestSession(t, &fakeCallbacks{})
+	s2.acpSessID = "test-session-id-2"
+	// promptSem left nil on both — unlimited, matching every non-Kiro ACP
+	// backend's pre-existing behaviour.
+
+	serveTrackingConcurrency(rReq1, wResp1, 80*time.Millisecond, &inFlight, &maxSeen)
+	serveTrackingConcurrency(rReq2, wResp2, 80*time.Millisecond, &inFlight, &maxSeen)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var err1, err2 error
+	go func() { defer wg.Done(); err1 = s1.Send("first", "m1", nil, nil) }()
+	go func() { defer wg.Done(); err2 = s2.Send("second", "m2", nil, nil) }()
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("Send 1: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("Send 2: %v", err2)
+	}
+	if got := maxSeen.Load(); got != 2 {
+		t.Fatalf("max concurrent server-side prompts = %d, want 2 (nil promptSem must not serialize)", got)
 	}
 }
 

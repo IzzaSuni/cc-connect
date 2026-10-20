@@ -49,6 +49,15 @@ type Agent struct {
 	modesCache   []core.PermissionModeInfo
 	modesCurrent string
 
+	// promptSem bounds how many session/prompt calls can be in flight at
+	// once across every session started by this Agent (i.e. every IM
+	// channel routed to this project). nil means unlimited — the
+	// pre-existing behaviour. Backends like Kiro's ACP bridge rate-limit
+	// per account, so several channels hammering it in parallel can
+	// trigger -32603s that no amount of per-call retry fully absorbs;
+	// capping concurrency here spaces out the calls instead.
+	promptSem chan struct{}
+
 	mu sync.RWMutex
 }
 
@@ -94,6 +103,11 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode, _ := opts["mode"].(string)
 	mode = strings.TrimSpace(mode)
 
+	var promptSem chan struct{}
+	if n := intOpt(opts["max_concurrent_prompts"]); n > 0 {
+		promptSem = make(chan struct{}, n)
+	}
+
 	return &Agent{
 		workDir:      workDir,
 		cmd:          cmdStr,
@@ -104,7 +118,24 @@ func New(opts map[string]any) (core.Agent, error) {
 		authMethod:   authMethod,
 		displayName:  displayName,
 		mode:         mode,
+		promptSem:    promptSem,
 	}, nil
+}
+
+// intOpt coerces a config option value (parsed from TOML as int64, or set
+// programmatically as int/float64) into an int. Non-numeric or missing
+// values yield 0.
+func intOpt(v any) int {
+	switch x := v.(type) {
+	case int64:
+		return int(x)
+	case int:
+		return x
+	case float64:
+		return int(x)
+	default:
+		return 0
+	}
 }
 
 func envMapFromOpts(opts map[string]any) map[string]string {
@@ -242,6 +273,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 		authMethod:      authMethod,
 		initialMode:     pendingMode,
 		callbacks:       a,
+		promptSem:       a.promptSem,
 	})
 }
 

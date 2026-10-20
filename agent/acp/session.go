@@ -42,6 +42,7 @@ type acpSession struct {
 
 	rateLimitHits atomic.Int64 // count of kiro rate_limit notifications
 	updatesSeen   atomic.Int64 // count of session/update notifications
+	promptSem     chan struct{} // shared across sibling sessions; nil = unlimited
 
 	cmd *exec.Cmd
 	tr  *transport
@@ -86,6 +87,7 @@ type acpSessionConfig struct {
 	authMethod      string
 	initialMode     string           // if non-empty, applied via session/set_mode after session/new
 	callbacks       sessionCallbacks // may be nil
+	promptSem       chan struct{}    // shared across sessions of the same Agent; nil = unlimited
 }
 
 func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, error) {
@@ -104,6 +106,7 @@ func newACPSession(ctx context.Context, cfg acpSessionConfig) (*acpSession, erro
 		toolInputByID: make(map[string]string),
 		acpSessID:     cfg.resumeSessionID,
 		callbacks:     cfg.callbacks,
+		promptSem:     cfg.promptSem,
 	}
 	s.alive.Store(true)
 
@@ -644,6 +647,15 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 // limit (a rate_limit notification followed by a generic -32603), waits and
 // retries instead of surfacing the error. Other failures are returned as-is.
 func (s *acpSession) promptWithRateLimitRetry(sid, prompt string) (json.RawMessage, error) {
+	if s.promptSem != nil {
+		select {
+		case s.promptSem <- struct{}{}:
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+		defer func() { <-s.promptSem }()
+	}
+
 	text := prompt
 	for attempt := 0; ; attempt++ {
 		hitsBefore := s.rateLimitHits.Load()
