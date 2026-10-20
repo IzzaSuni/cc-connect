@@ -213,6 +213,61 @@ func TestSend_maxConcurrentPromptsSerializesAcrossSessions(t *testing.T) {
 	}
 }
 
+// TestSend_hungCallForceReleasesSlotForSiblingSession reproduces the
+// production incident: one session's session/prompt never gets *any*
+// response (backend hang, unanswered permission request, dead subprocess
+// that doesn't exit) and so never returns. Without a forced release, that
+// permanently starves every sibling session sharing the same promptSem —
+// which is exactly what happened when max_concurrent_prompts=1 was deployed.
+func TestSend_hungCallForceReleasesSlotForSiblingSession(t *testing.T) {
+	orig := promptSlotMaxHold
+	promptSlotMaxHold = 30 * time.Millisecond
+	t.Cleanup(func() { promptSlotMaxHold = orig })
+
+	sem := make(chan struct{}, 1)
+	var inFlight, maxSeen atomic.Int64
+
+	hung, _, rReqHung := newTestSession(t, &fakeCallbacks{})
+	hung.promptSem = sem
+	ok, wResp2, rReq2 := newTestSession(t, &fakeCallbacks{})
+	ok.promptSem = sem
+	ok.acpSessID = "test-session-id-2"
+
+	// hung's "server" never writes a response for any request — simulates a
+	// backend that hangs forever, or a permission request nobody answers.
+	go func() {
+		_, _ = io.Copy(io.Discard, rReqHung)
+	}()
+	serveTrackingConcurrency(rReq2, wResp2, 10*time.Millisecond, &inFlight, &maxSeen)
+
+	hungDone := make(chan error, 1)
+	go func() { hungDone <- hung.Send("stuck forever", "m1", nil, nil) }()
+
+	// Give the hung call time to acquire the slot and exceed promptSlotMaxHold.
+	time.Sleep(150 * time.Millisecond)
+
+	// The second, healthy session must still be able to get the slot and
+	// complete — proving the force-release freed it rather than leaving it
+	// permanently held.
+	done2 := make(chan error, 1)
+	go func() { done2 <- ok.Send("i should still work", "m2", nil, nil) }()
+
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("sibling session's Send failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sibling session never got the semaphore slot — hung call starved it forever")
+	}
+
+	// Clean up: the hung call is still blocked on its own RPC response
+	// (that's realistic — it never completes on its own); cancel its
+	// context so the test doesn't leak a goroutine.
+	hung.cancel()
+	<-hungDone
+}
+
 func TestSend_nilPromptSemAllowsConcurrentSends(t *testing.T) {
 	var inFlight, maxSeen atomic.Int64
 

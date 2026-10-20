@@ -32,6 +32,17 @@ const rateLimitContinuePrompt = "The previous turn was interrupted by a temporar
 // rateLimitBackoffs is the wait before each retry of a rate-limited prompt.
 var rateLimitBackoffs = []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}
 
+// promptSlotMaxHold bounds how long a single session/prompt call may hold a
+// shared promptSem slot (see Agent.max_concurrent_prompts). Legitimate turns
+// have been observed running 15+ minutes, so this must stay generous — but
+// without *some* cap, one call that never gets a response (backend hang, a
+// permission request nobody answers, a dead subprocess that doesn't exit)
+// holds the slot forever and permanently blocks every sibling session on
+// the same Agent. When the cap fires we release the slot early so other
+// sessions can proceed; the stuck call itself keeps running in its own
+// goroutine and will still complete (or fail) on its own.
+var promptSlotMaxHold = 20 * time.Minute
+
 type acpSession struct {
 	workDir string
 	events  chan core.Event
@@ -643,18 +654,43 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 	return nil
 }
 
+// acquirePromptSlot blocks until a shared promptSem slot is available (or
+// forever if promptSem is nil — unlimited, the pre-existing behaviour), then
+// returns a release func that frees the slot. The slot is force-released
+// after promptSlotMaxHold even if the caller never calls release, so one
+// hung session/prompt call cannot starve every sibling session forever.
+// release is safe to call more than once (only the first call has effect).
+func (s *acpSession) acquirePromptSlot() (release func(), acquired bool) {
+	if s.promptSem == nil {
+		return func() {}, true
+	}
+	select {
+	case s.promptSem <- struct{}{}:
+	case <-s.ctx.Done():
+		return nil, false
+	}
+	var once sync.Once
+	freed := func() { once.Do(func() { <-s.promptSem }) }
+	timer := time.AfterFunc(promptSlotMaxHold, func() {
+		slog.Warn("acp: session/prompt exceeded max hold time, force-releasing concurrency slot for sibling sessions",
+			"session_id", s.currentACPSessionID(), "max_hold", promptSlotMaxHold)
+		freed()
+	})
+	return func() {
+		timer.Stop()
+		freed()
+	}, true
+}
+
 // promptWithRateLimitRetry sends session/prompt and, when Kiro reports a rate
 // limit (a rate_limit notification followed by a generic -32603), waits and
 // retries instead of surfacing the error. Other failures are returned as-is.
 func (s *acpSession) promptWithRateLimitRetry(sid, prompt string) (json.RawMessage, error) {
-	if s.promptSem != nil {
-		select {
-		case s.promptSem <- struct{}{}:
-		case <-s.ctx.Done():
-			return nil, s.ctx.Err()
-		}
-		defer func() { <-s.promptSem }()
+	release, acquired := s.acquirePromptSlot()
+	if !acquired {
+		return nil, s.ctx.Err()
 	}
+	defer release()
 
 	text := prompt
 	for attempt := 0; ; attempt++ {
