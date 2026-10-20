@@ -30,7 +30,13 @@ const kiroRateLimitMethod = "_kiro.dev/error/rate_limit"
 const rateLimitContinuePrompt = "The previous turn was interrupted by a temporary rate limit. Continue exactly where you left off; do not redo steps that already completed."
 
 // rateLimitBackoffs is the wait before each retry of a rate-limited prompt.
-var rateLimitBackoffs = []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}
+// Total budget here is 10+30+60+120+180 = 400s (~6.7 min). Observed incident
+// on 2026-10-20: a single rate-limit episode lasted 3+ minutes (several
+// rate_limit notifications roughly a minute apart), which exhausted the
+// previous 3-attempt/100s budget and surfaced -32603 to the user even though
+// retrying would likely have succeeded shortly after. Extending to 5
+// attempts covers that observed episode length with margin.
+var rateLimitBackoffs = []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second, 2 * time.Minute, 3 * time.Minute}
 
 // promptSlotMaxHold bounds how long a single session/prompt call may hold a
 // shared promptSem slot (see Agent.max_concurrent_prompts). Legitimate turns
