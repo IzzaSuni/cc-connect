@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,15 @@ import (
 // roughly half the map (iteration order is arbitrary) to bound memory.
 const toolInputCacheMaxEntries = 1000
 
+const kiroRateLimitMethod = "_kiro.dev/error/rate_limit"
+
+// rateLimitContinuePrompt replaces the original prompt on retry when the turn
+// had already produced output, so finished work is not replayed.
+const rateLimitContinuePrompt = "The previous turn was interrupted by a temporary rate limit. Continue exactly where you left off; do not redo steps that already completed."
+
+// rateLimitBackoffs is the wait before each retry of a rate-limited prompt.
+var rateLimitBackoffs = []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second}
+
 type acpSession struct {
 	workDir string
 	events  chan core.Event
@@ -29,6 +39,9 @@ type acpSession struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	alive   atomic.Bool
+
+	rateLimitHits atomic.Int64 // count of kiro rate_limit notifications
+	updatesSeen   atomic.Int64 // count of session/update notifications
 
 	cmd *exec.Cmd
 	tr  *transport
@@ -367,9 +380,13 @@ func (s *acpSession) matchAvailableMode(input string) string {
 
 func (s *acpSession) onNotification(method string, params json.RawMessage) {
 	if method != "session/update" {
+		if method == kiroRateLimitMethod {
+			s.rateLimitHits.Add(1)
+		}
 		slog.Debug("acp: notification", "method", method)
 		return
 	}
+	s.updatesSeen.Add(1)
 	s.cacheToolCallInput(params)
 	s.maybeAbsorbCurrentModeUpdate(params)
 	sid := s.currentACPSessionID()
@@ -606,16 +623,8 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 		return fmt.Errorf("acp: no agent session id")
 	}
 
-	promptBlocks := []any{
-		map[string]any{"type": "text", "text": prompt},
-	}
-	params := map[string]any{
-		"sessionId": sid,
-		"prompt":    promptBlocks,
-	}
-
 	slog.Debug("acp: sending session/prompt", "session_id", sid, "prompt_len", len(prompt))
-	res, err := s.tr.call(s.ctx, "session/prompt", params)
+	res, err := s.promptWithRateLimitRetry(sid, prompt)
 	if err != nil {
 		s.emit(core.Event{Type: core.EventError, Error: err})
 		return fmt.Errorf("acp: session/prompt: %w", err)
@@ -629,6 +638,39 @@ func (s *acpSession) Send(prompt string, messageID string, images []core.ImageAt
 		Done:      true,
 	})
 	return nil
+}
+
+// promptWithRateLimitRetry sends session/prompt and, when Kiro reports a rate
+// limit (a rate_limit notification followed by a generic -32603), waits and
+// retries instead of surfacing the error. Other failures are returned as-is.
+func (s *acpSession) promptWithRateLimitRetry(sid, prompt string) (json.RawMessage, error) {
+	text := prompt
+	for attempt := 0; ; attempt++ {
+		hitsBefore := s.rateLimitHits.Load()
+		updatesBefore := s.updatesSeen.Load()
+		res, err := s.tr.call(s.ctx, "session/prompt", map[string]any{
+			"sessionId": sid,
+			"prompt":    []any{map[string]any{"type": "text", "text": text}},
+		})
+		if err == nil {
+			return res, nil
+		}
+		var rpcErr *rpcErrPayload
+		if attempt >= len(rateLimitBackoffs) || !errors.As(err, &rpcErr) || rpcErr.Code != -32603 ||
+			s.rateLimitHits.Load() == hitsBefore {
+			return nil, err
+		}
+		if s.updatesSeen.Load() != updatesBefore {
+			text = rateLimitContinuePrompt
+		}
+		wait := rateLimitBackoffs[attempt]
+		slog.Warn("acp: rate limited, retrying prompt", "session_id", sid, "attempt", attempt+1, "of", len(rateLimitBackoffs), "wait", wait)
+		select {
+		case <-time.After(wait):
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
 }
 
 func (s *acpSession) appendImageRefs(prompt string, images []core.ImageAttachment) string {

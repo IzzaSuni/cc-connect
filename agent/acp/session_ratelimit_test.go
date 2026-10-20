@@ -1,0 +1,171 @@
+package acp
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/chenhg5/cc-connect/core"
+)
+
+type promptScript struct {
+	rateLimit bool // emit kiro rate_limit notification before the error
+	update    bool // emit a session/update before the error (mid-turn failure)
+	fail      bool // answer with -32603
+}
+
+// serveScripted answers each session/prompt according to scripts in order
+// and records the prompt text of every request.
+func serveScripted(rReq io.Reader, wResp io.Writer, scripts []promptScript) (*[]string, *sync.WaitGroup) {
+	var mu sync.Mutex
+	prompts := []string{}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sc := bufio.NewScanner(rReq)
+		i := 0
+		for sc.Scan() {
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					Prompt []struct {
+						Text string `json:"text"`
+					} `json:"prompt"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(sc.Bytes(), &req) != nil || req.Method != "session/prompt" {
+				continue
+			}
+			mu.Lock()
+			prompts = append(prompts, req.Params.Prompt[0].Text)
+			mu.Unlock()
+			sc := scripts[min(i, len(scripts)-1)]
+			i++
+			if sc.update {
+				_, _ = fmt.Fprint(wResp, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"test-session-id","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"}}}}`+"\n")
+			}
+			if sc.rateLimit {
+				_, _ = fmt.Fprint(wResp, `{"jsonrpc":"2.0","method":"_kiro.dev/error/rate_limit","params":{}}`+"\n")
+			}
+			if sc.fail {
+				_, _ = fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"Internal error"}}`+"\n", req.ID)
+			} else {
+				_, _ = fmt.Fprintf(wResp, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", req.ID)
+			}
+		}
+	}()
+	return &prompts, &wg
+}
+
+func fastBackoff(t *testing.T, n int) {
+	t.Helper()
+	orig := rateLimitBackoffs
+	rateLimitBackoffs = make([]time.Duration, n)
+	for i := range rateLimitBackoffs {
+		rateLimitBackoffs[i] = time.Millisecond
+	}
+	t.Cleanup(func() { rateLimitBackoffs = orig })
+}
+
+func drainEvents(s *acpSession) []core.Event {
+	var evs []core.Event
+	for {
+		select {
+		case ev := <-s.events:
+			evs = append(evs, ev)
+		default:
+			return evs
+		}
+	}
+}
+
+func TestSend_retriesAfterRateLimit(t *testing.T) {
+	fastBackoff(t, 3)
+	s, wResp, rReq := newTestSession(t, &fakeCallbacks{})
+	prompts, _ := serveScripted(rReq, wResp, []promptScript{
+		{rateLimit: true, fail: true},
+		{rateLimit: true, fail: true},
+		{},
+	})
+
+	if err := s.Send("hello", "m1", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(*prompts) != 3 {
+		t.Fatalf("prompt calls = %d, want 3", len(*prompts))
+	}
+	for i, p := range *prompts {
+		if p != "hello" {
+			t.Fatalf("retry %d resent %q, want original prompt (no output had been produced)", i, p)
+		}
+	}
+	for _, ev := range drainEvents(s) {
+		if ev.Type == core.EventError {
+			t.Fatalf("error event leaked to user during retried rate limit: %v", ev.Error)
+		}
+	}
+}
+
+func TestSend_rateLimitRetriesExhausted(t *testing.T) {
+	fastBackoff(t, 2)
+	s, wResp, rReq := newTestSession(t, &fakeCallbacks{})
+	prompts, _ := serveScripted(rReq, wResp, []promptScript{{rateLimit: true, fail: true}})
+
+	err := s.Send("hello", "m1", nil, nil)
+	if err == nil {
+		t.Fatal("Send should fail after retries are exhausted")
+	}
+	if len(*prompts) != 3 {
+		t.Fatalf("prompt calls = %d, want 3 (1 + 2 retries)", len(*prompts))
+	}
+	errEvents := 0
+	for _, ev := range drainEvents(s) {
+		if ev.Type == core.EventError {
+			errEvents++
+		}
+	}
+	if errEvents != 1 {
+		t.Fatalf("error events = %d, want exactly 1", errEvents)
+	}
+}
+
+func TestSend_internalErrorWithoutRateLimitNotRetried(t *testing.T) {
+	fastBackoff(t, 3)
+	s, wResp, rReq := newTestSession(t, &fakeCallbacks{})
+	prompts, _ := serveScripted(rReq, wResp, []promptScript{{fail: true}})
+
+	if err := s.Send("hello", "m1", nil, nil); err == nil {
+		t.Fatal("Send should surface a plain -32603")
+	}
+	if len(*prompts) != 1 {
+		t.Fatalf("prompt calls = %d, want 1 (no rate_limit signal, no retry)", len(*prompts))
+	}
+}
+
+func TestSend_midTurnRateLimitSendsContinuePrompt(t *testing.T) {
+	fastBackoff(t, 3)
+	s, wResp, rReq := newTestSession(t, &fakeCallbacks{})
+	prompts, _ := serveScripted(rReq, wResp, []promptScript{
+		{update: true, rateLimit: true, fail: true},
+		{},
+	})
+
+	if err := s.Send("do the big task", "m1", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if len(*prompts) != 2 {
+		t.Fatalf("prompt calls = %d, want 2", len(*prompts))
+	}
+	if (*prompts)[1] == "do the big task" {
+		t.Fatal("mid-turn retry must not replay the original prompt (would redo finished work)")
+	}
+	if (*prompts)[1] != rateLimitContinuePrompt {
+		t.Fatalf("retry prompt = %q, want continue prompt", (*prompts)[1])
+	}
+}
